@@ -1,0 +1,109 @@
+[tool.poetry]
+name = "pyfaye"
+version = "0.1.0"
+description = "Python client for Faye pub/sub protocol"
+authors = ["Mike Whobrey <mwhobrey88@gmail.com>"]
+readme = "README.md"
+license = "MIT"
+homepage = "https://mikewhob.com/pyfaye"
+repository = "https://github.com/mwhobrey/pyfaye"
+keywords = ["faye", "websocket", "pubsub", "realtime", "bayeux"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.10",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Internet :: WWW/HTTP :: Dynamic Content",
+    "Framework :: AsyncIO",
+]
+packages = [{include = "faye", from = "src"}]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+aiohttp = "^3.9.1"
+websockets = "^12.0"
+backoff = "^2.2.1"
+typing-extensions = "^4.9.0"
+
+[tool.poetry.group.test.dependencies]
+pytest = "^7.4.3"
+pytest-asyncio = "^0.21.1"
+pytest-cov = "^4.1.0"
+aioresponses = "^0.7.4"
+pytest-mock = "^3.12.0"
+asynctest = "^0.13.0"
+
+[tool.poetry.group.dev.dependencies]
+black = "^24.1.0"
+mypy = "^1.8.0"
+ruff = "^0.2.0"
+pdoc3 = "^0.10.0"
+flake8 = "^6.1.0"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.pytest.ini_options]
+asyncio_mode = "strict"
+
+[tool.coverage.run]
+source = ["faye"]
+omit = ["tests/*", "**/__init__.py"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "pass",
+    "raise ImportError"
+]
+
+[tool.black]
+line-length = 88
+target-version = ['py310']
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "C",   # flake8-comprehensions
+    "B",   # flake8-bugbear
+    "S",   # flake8-bandit (security)
+    "N",   # pep8-naming
+    "D",   # pydocstyle
+    "UP",  # pyupgrade
+    "ANN", # flake8-annotations
+    "RUF", # Ruff-specific rules
+    "ERA",  # eradicate (commented out code)
+    "PTH",  # use pathlib
+    "SIM",  # simplify code
+    "TCH",  # type checking
+    "TID",  # tidy imports
+]
+ignore = [
+    "E501",  # Line too long
+    "D100",  # Missing docstring in public module
+    "D104",  # Missing docstring in public package
+    "ANN101", # Missing type annotation for self
+    "ANN102", # Missing type annotation for cls
+]
+
+[tool.poetry.scripts]
+pyfaye = "faye.cli:main"
+check = "scripts.check:main" 
