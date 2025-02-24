@@ -1,6 +1,6 @@
 from typing import Any
 
-from faye.exceptions import AuthenticationError
+from faye.exceptions import FayeError
 from faye.protocol import Message
 
 from .base import Extension
@@ -42,7 +42,9 @@ class AuthenticationExtension(Extension):
         """
         self.token = token
 
-    async def outgoing(self, message: Message) -> Message:
+    def outgoing(
+        self, message: Message, request: Message | None = None
+    ) -> Message | None:
         """Add authentication token to outgoing handshake messages.
 
         Adds the auth token to the message's ext field only for handshake
@@ -51,6 +53,7 @@ class AuthenticationExtension(Extension):
         Args:
         ----
             message: The outgoing message
+            request: The request message (optional)
 
         Returns:
         -------
@@ -69,34 +72,20 @@ class AuthenticationExtension(Extension):
             message.ext["auth"] = {"token": self.token}
         return message
 
-    async def incoming(self, message: Message) -> Message:
-        """Handle authentication errors in incoming messages.
-
-        Checks incoming messages for authentication errors and raises
-        an AuthenticationError if one is found.
+    async def process_incoming(self, message: Message) -> Message | None:
+        """Process incoming messages and check for authentication errors.
 
         Args:
-        ----
-            message: The incoming message
+            message: Message to process
 
         Returns:
-        -------
-            Message: The unmodified message if no auth errors
+            Processed message or None if rejected
 
         Raises:
-        ------
-            AuthenticationError: If the message contains an auth_error
-
-        Note:
-        ----
-            Expects auth errors in the format:
-            {"ext": {"auth_error": "error message"}}
-
+            FayeError: If the message contains an auth_error (401)
         """
-        if message.ext is None:
-            return message
-        if not message.successful and message.ext.get("auth_error"):
-            raise AuthenticationError(message.ext["auth_error"])
+        if message.ext and "auth_error" in message.ext:
+            raise FayeError(401, ["auth"], message.ext["auth_error"])  # Unauthorized
         return message
 
     def get_ext(self) -> dict[str, Any]:

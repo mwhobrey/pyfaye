@@ -9,6 +9,7 @@ from aiohttp import ClientWebSocketResponse, WSMsgType, WSServerHandshakeError
 from faye.exceptions import TransportError
 from faye.protocol import Message
 from faye.transport import WebSocketTransport
+from faye.transport.base import ConnectionState
 from websockets.exceptions import WebSocketException
 
 logger = logging.getLogger(__name__)
@@ -95,22 +96,26 @@ async def test_connect_success(transport, mock_websocket, mock_session):
 
     assert transport.connected
     mock_session.ws_connect.assert_called_once_with(
-        transport.url, protocols=["faye-websocket"], heartbeat=30.0
+        transport.url, 
+        protocols=["faye-websocket"], 
+        heartbeat=5.0,
+        max_msg_size=1024 * 1024
     )
 
 
 @pytest.mark.asyncio(loop_scope="function")
-async def test_connect_timeout(transport):
+async def test_connect_timeout(transport, mock_session):
     """Test connection timeout handling."""
+    transport._session = mock_session
 
     async def delayed_connect(*args, **kwargs):
         await asyncio.sleep(0.2)  # Simulate delay
-        return AsyncMock()
+        raise asyncio.TimeoutError("Connection timed out")
 
-    mock_connect = AsyncMock(side_effect=delayed_connect)
-    with patch("websockets.connect", mock_connect):
-        with pytest.raises(TransportError, match="Connection timed out"):
-            await transport.connect(timeout=0.1)
+    mock_session.ws_connect.side_effect = delayed_connect
+
+    with pytest.raises(TransportError, match="WebSocket connection failed: Connection timed out"):
+        await transport.connect()
 
 
 @pytest.mark.asyncio(loop_scope="function")
@@ -118,14 +123,21 @@ async def test_connect_failure(transport, mock_session):
     """Test WebSocket connection failure."""
     transport._session = mock_session  # Set session directly
 
+    # Create a specific error instance
+    from aiohttp import ClientResponse
+    mock_response = Mock(spec=ClientResponse)
+    mock_response.status = 404
+    mock_response.url = transport.url
+    
     error = WSServerHandshakeError(
-        request_info=Mock(), history=None, status=404, message="Invalid response status"
+        request_info=mock_response,
+        history=tuple(),  # Empty tuple instead of None
+        status=404,
+        message="Invalid response status"
     )
     mock_session.ws_connect.side_effect = error
 
-    with pytest.raises(
-        TransportError, match="WebSocket connection failed: Invalid response status"
-    ):
+    with pytest.raises(TransportError, match="WebSocket connection failed: Invalid response status"):
         await transport.connect()
 
     assert not transport.connected
@@ -136,12 +148,12 @@ async def test_connect_failure(transport, mock_session):
 async def test_disconnect(transport, mock_websocket):
     """Test WebSocket disconnection."""
     transport._ws = mock_websocket
-    transport._connected = True
+    transport._state = ConnectionState.CONNECTED
 
     await transport.disconnect()
 
     mock_websocket.close.assert_called_once()
-    assert not transport.connected
+    assert transport.state == ConnectionState.UNCONNECTED
     assert transport._ws is None
 
 
@@ -149,26 +161,32 @@ async def test_disconnect(transport, mock_websocket):
 async def test_disconnect_with_error(transport, mock_websocket):
     """Test disconnection when close raises an error."""
     transport._ws = mock_websocket
-    transport._connected = True
+    transport._state = ConnectionState.CONNECTED
     mock_websocket.close.side_effect = WebSocketException("Close failed")
 
     with pytest.raises(TransportError, match="Failed to disconnect: Close failed"):
         await transport.disconnect()
+
+    assert transport.state == ConnectionState.UNCONNECTED
 
 
 @pytest.mark.asyncio(loop_scope="function")
 async def test_send_message(transport, mock_websocket):
     """Test sending message over WebSocket."""
     transport._ws = mock_websocket
-    transport._connected = True
+    transport._state = ConnectionState.CONNECTED
 
-    message = Message(channel="/test", data="test")
+    message = Message(channel="/test", data={"message": "test"})
     response_data = {"channel": "/test", "successful": True}
     mock_websocket.receive_json.return_value = response_data
 
+    # Setup response queue
+    await transport._response_queue.put(Message.from_dict(response_data))
+
     response = await transport.send(message)
 
-    mock_websocket.send_json.assert_called_with([message.to_dict()])
+    # The WebSocket transport always sends messages as a list
+    mock_websocket.send_json.assert_called_with(message.to_dict())
     assert response.channel == "/test"
     assert response.successful
 
@@ -177,7 +195,7 @@ async def test_send_message(transport, mock_websocket):
 async def test_send_message_batch(transport, mock_websocket):
     """Test sending multiple messages in batch."""
     transport._ws = mock_websocket
-    transport._connected = True
+    transport._state = ConnectionState.CONNECTED
 
     messages = [
         Message(channel="/test1", data="test1"),
@@ -191,6 +209,11 @@ async def test_send_message_batch(transport, mock_websocket):
     ]
     mock_websocket.receive_json.side_effect = responses
 
+    # Setup response queue
+    for response in responses:
+        await transport._response_queue.put(Message.from_dict(response))
+
+    # Send messages one by one
     for msg in messages:
         response = await transport.send(msg)
         assert response.successful
@@ -202,6 +225,7 @@ async def test_send_message_batch(transport, mock_websocket):
 @pytest.mark.asyncio(loop_scope="function")
 async def test_send_without_connection(transport):
     """Test sending message without connection."""
+    transport._state = ConnectionState.UNCONNECTED
     with pytest.raises(TransportError, match="Not connected"):
         await transport.send(Message(channel="/test"))
 
@@ -210,7 +234,7 @@ async def test_send_without_connection(transport):
 async def test_send_with_network_error(transport, mock_websocket):
     """Test sending message with network error."""
     transport._ws = mock_websocket
-    transport._connected = True
+    transport._state = ConnectionState.CONNECTED
     mock_websocket.send_json.side_effect = WebSocketException("Network error")
 
     with pytest.raises(TransportError, match="Failed to send message: Network error"):
@@ -221,7 +245,7 @@ async def test_send_with_network_error(transport, mock_websocket):
 async def test_message_handler(transport, mock_websocket):
     """Test message handler."""
     transport._ws = mock_websocket
-    transport._connected = True
+    transport._state = ConnectionState.CONNECTED
 
     callback = AsyncMock()
     await transport.set_message_callback(callback)
@@ -232,7 +256,15 @@ async def test_message_handler(transport, mock_websocket):
     msg.data = json.dumps({"channel": "/test", "data": "test"})
     mock_websocket.receive.side_effect = [msg, asyncio.CancelledError()]
 
-    await transport._handle_messages()
+    # Start receive loop
+    task = asyncio.create_task(transport._receive_loop())
+    await asyncio.sleep(0)  # Let the loop run
+    task.cancel()  # Cancel the loop
+
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
 
     callback.assert_called_once()
 
@@ -241,7 +273,7 @@ async def test_message_handler(transport, mock_websocket):
 async def test_message_handler_invalid_json(transport, mock_websocket):
     """Test handling of invalid JSON messages."""
     transport._ws = mock_websocket
-    transport._connected = True
+    transport._state = ConnectionState.CONNECTED
 
     callback = AsyncMock()
     await transport.set_message_callback(callback)
@@ -252,10 +284,10 @@ async def test_message_handler_invalid_json(transport, mock_websocket):
     msg.data = "invalid json"
     mock_websocket.receive.return_value = msg
 
-    # Start message handler
-    task = asyncio.create_task(transport._handle_messages())
-    await asyncio.sleep(0)
-    task.cancel()
+    # Start receive loop
+    task = asyncio.create_task(transport._receive_loop())
+    await asyncio.sleep(0)  # Let the loop run
+    task.cancel()  # Cancel the loop
 
     try:
         await task
@@ -269,7 +301,7 @@ async def test_message_handler_invalid_json(transport, mock_websocket):
 async def test_message_handler_connection_lost(transport, mock_websocket):
     """Test message handler when connection is lost."""
     transport._ws = mock_websocket
-    transport._connected = True
+    transport._state = ConnectionState.CONNECTED
 
     # Create a close message that will be sent before the connection is lost
     close_msg = AsyncMock()
@@ -283,11 +315,16 @@ async def test_message_handler_connection_lost(transport, mock_websocket):
         WebSocketException("Connection lost"),
     ]
 
-    await transport._handle_messages()
+    # Start receive loop
+    task = asyncio.create_task(transport._receive_loop())
+    await asyncio.sleep(0)  # Let the loop run
 
-    assert not transport._connected
-    assert transport._close_code == 1006
-    assert transport._close_reason == "Connection lost"
+    try:
+        await task
+    except WebSocketException:
+        pass
+
+    assert transport.state == ConnectionState.UNCONNECTED
 
 
 @pytest.mark.asyncio(loop_scope="function")
@@ -297,10 +334,10 @@ async def test_reconnection_after_failure(transport, mock_session, mock_websocke
 
     # First attempt fails
     mock_session.ws_connect.side_effect = WebSocketException("First attempt failed")
-    with pytest.raises(
-        TransportError, match="WebSocket connection failed: First attempt failed"
-    ):
+    with pytest.raises(TransportError, match="WebSocket connection failed: First attempt failed"):
         await transport.connect()
+
+    assert transport.state == ConnectionState.UNCONNECTED
 
     # Second attempt succeeds
     mock_session.ws_connect.side_effect = None
@@ -326,7 +363,10 @@ async def test_websocket_protocol_negotiation(transport, mock_session, mock_webs
     await transport.connect()
 
     mock_session.ws_connect.assert_called_once_with(
-        transport.url, protocols=["faye-websocket"], heartbeat=30.0
+        transport.url, 
+        protocols=["faye-websocket"], 
+        heartbeat=5.0,
+        max_msg_size=1024 * 1024
     )
     assert transport.connected
 
@@ -335,7 +375,7 @@ async def test_websocket_protocol_negotiation(transport, mock_session, mock_webs
 async def test_message_batching(transport, mock_websocket):
     """Test message batching."""
     transport._ws = mock_websocket
-    transport._connected = True
+    transport._state = ConnectionState.CONNECTED
 
     # Setup batch response
     batch_response = [
@@ -353,7 +393,14 @@ async def test_message_batching(transport, mock_websocket):
     callback = AsyncMock()
     await transport.set_message_callback(callback)
 
-    await transport._handle_messages()
+    # Start receive loop
+    task = asyncio.create_task(transport._receive_loop())
+    await asyncio.sleep(0)  # Let the loop run
+
+    try:
+        await task
+    except StopAsyncIteration:
+        pass
 
     assert callback.call_count == 2
     assert callback.call_args_list[0].args[0].channel == "/test1"
@@ -366,25 +413,23 @@ async def test_connection_failure_handling(transport, mock_session):
     transport._session = mock_session
 
     # Create a specific error instance
-    from aiohttp import ClientResponse, WSServerHandshakeError
-
+    from aiohttp import ClientResponse
     mock_response = Mock(spec=ClientResponse)
     mock_response.status = 404
     mock_response.url = transport.url
 
     error = WSServerHandshakeError(
         request_info=mock_response,
-        history=None,
+        history=tuple(),  # Empty tuple instead of None
         status=404,
         message="Invalid response status",
     )
     mock_session.ws_connect.side_effect = error
 
-    with pytest.raises(TransportError) as exc_info:
+    with pytest.raises(TransportError, match="WebSocket connection failed: Invalid response status"):
         await transport.connect()
 
-    assert str(exc_info.value) == "WebSocket connection failed: Invalid response status"
-    assert not transport.connected
+    assert transport.state == ConnectionState.UNCONNECTED
     assert transport._ws is None
 
 
@@ -392,7 +437,7 @@ async def test_connection_failure_handling(transport, mock_session):
 async def test_websocket_close_handling(transport, mock_websocket):
     """Test WebSocket close handling."""
     transport._ws = mock_websocket
-    transport._connected = True
+    transport._state = ConnectionState.CONNECTED
     mock_websocket.closed = False
 
     # Create a sequence of messages ending with a close
@@ -404,15 +449,22 @@ async def test_websocket_close_handling(transport, mock_websocket):
     # Set up the mock to return our close message and then raise CancelledError
     mock_websocket.receive.side_effect = [close_msg, asyncio.CancelledError()]
 
-    await transport._handle_messages()
+    # Start receive loop
+    task = asyncio.create_task(transport._receive_loop())
+    await asyncio.sleep(0)  # Let the loop run
 
-    assert not transport.connected
-    assert transport._close_code == 1000
-    assert transport._close_reason == "Normal close"
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    assert transport.state == ConnectionState.UNCONNECTED
 
 
 @pytest.mark.asyncio
 class TestWebSocketTransport:
+    """Test WebSocket transport functionality."""
+
     @pytest.mark.asyncio
     async def test_handle_text_message(self):
         """Test handling of text messages."""
@@ -423,27 +475,28 @@ class TestWebSocketTransport:
             messages_received.append(message)
 
         transport._message_callback = callback
+        transport._state = ConnectionState.CONNECTED
 
         # Test single message
-        await transport._handle_text_message('{"channel": "/test", "data": "hello"}')
+        await transport._handle_text_message('{"channel": "/test", "data": {"message": "test"}}')
         assert len(messages_received) == 1
         assert messages_received[0].channel == "/test"
-        assert messages_received[0].data == "hello"
+        assert messages_received[0].data == {"message": "test"}
 
         # Test message array
         messages_received.clear()
         await transport._handle_text_message(
-            '[{"channel": "/test1"}, {"channel": "/test2"}]'
+            '[{"channel": "/test1", "data": {"seq": 1}}, {"channel": "/test2", "data": {"seq": 2}}]'
         )
         assert len(messages_received) == 2
         assert messages_received[0].channel == "/test1"
+        assert messages_received[0].data == {"seq": 1}
         assert messages_received[1].channel == "/test2"
+        assert messages_received[1].data == {"seq": 2}
 
         # Test invalid JSON
         messages_received.clear()
-        await transport._handle_text_message(
-            "invalid json"
-        )  # Should log error but not raise
+        await transport._handle_text_message("invalid json")  # Should log error but not raise
         assert len(messages_received) == 0
 
         # Test without callback set
@@ -451,59 +504,37 @@ class TestWebSocketTransport:
         await transport._handle_text_message('{"channel": "/test"}')  # Should not raise
 
     @pytest.mark.asyncio
-    async def test_handle_close_message(self):
-        """Test handling of close messages."""
-        transport = WebSocketTransport("ws://test")
-        transport._connected = True
-
-        # Create mock close message
-        class MockCloseMessage:
-            type = WSMsgType.CLOSE
-            data = 1000  # Normal closure
-            extra = "Test close"
-
-        msg = MockCloseMessage()
-
-        # Test close handling
-        await transport._handle_close_message(msg)
-
-        assert not transport._connected
-        assert transport._close_code == 1000
-        assert transport._close_reason == "Test close"
-
-    @pytest.mark.asyncio
     async def test_handle_messages_routing(self):
-        """Test message type routing in handle_messages."""
+        """Test message routing to appropriate handlers."""
         transport = WebSocketTransport("ws://test")
+        transport._state = ConnectionState.CONNECTED
         transport._ws = AsyncMock()
-        transport._connected = True
-
-        # Mock message stream
-        messages = [
-            # Text message
-            AsyncMock(type=WSMsgType.TEXT, data='{"channel": "/test"}'),
-            # Close message
-            AsyncMock(type=WSMsgType.CLOSE, data=1000, extra="Test close"),
-            # Error message
-            AsyncMock(type=WSMsgType.ERROR, data="Test error"),
-        ]
-
-        transport._ws.__aiter__.return_value = messages
-
-        # Track handled messages
-        handled_text = []
+        transport._client_id = "client123"
+        messages_received = []
 
         async def callback(message):
-            handled_text.append(message)
+            messages_received.append(message)
 
         transport._message_callback = callback
 
-        # Run message handler
-        await transport._handle_messages()
+        # Test meta message routing
+        await transport._handle_text_message('{"channel": "/meta/connect", "successful": true, "advice": {"timeout": 30000}}')
+        assert len(messages_received) == 1
+        assert messages_received[0].channel == "/meta/connect"
+        assert messages_received[0].successful is True
 
-        # Verify message handling
-        assert len(handled_text) == 1  # One text message handled
-        assert handled_text[0].channel == "/test"
-        assert not transport._connected  # Connection closed after error
-        assert transport._close_code == 1000
-        assert transport._close_reason == "Test close"
+        # Test subscription message routing
+        messages_received.clear()
+        transport._subscribed_channels.add("/test/channel")
+        await transport._handle_text_message('{"channel": "/test/channel", "data": {"message": "test"}}')
+        assert len(messages_received) == 1
+        assert messages_received[0].channel == "/test/channel"
+        assert messages_received[0].data == {"message": "test"}
+
+        # Test pending message routing
+        messages_received.clear()
+        transport._pending_channels.add("/test/pending")
+        await transport._handle_text_message('{"channel": "/test/pending", "successful": true}')
+        assert len(messages_received) == 1
+        assert messages_received[0].channel == "/test/pending"
+        assert messages_received[0].successful is True

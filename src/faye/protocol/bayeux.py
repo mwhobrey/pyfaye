@@ -1,13 +1,40 @@
+"""Bayeux protocol implementation following official Faye client."""
+
 import json
 import logging
+import re
 from asyncio import Lock
 from typing import Any, ClassVar
 
-from faye.exceptions import FayeError, HandshakeError, ProtocolError
-
-from .message import Message, MessageFactory
+from faye.exceptions import ErrorCode, FayeError
+from faye.protocol.message import Message
 
 logger = logging.getLogger(__name__)
+
+
+class BayeuxError(FayeError):
+    """Base class for Bayeux protocol errors."""
+
+    def __init__(
+        self,
+        message: str,
+        code: ErrorCode | int | None = None,
+        params: list[Any] | None = None,
+    ) -> None:
+        """Initialize BayeuxError."""
+        if isinstance(code, int):
+            code_val = code
+        else:
+            code_val = code.value if code is not None else ErrorCode.SERVER_ERROR.value
+        super().__init__(code_val, params or [], message)
+
+
+class HandshakeError(BayeuxError):
+    """Error during handshake process."""
+
+
+class ProtocolError(BayeuxError):
+    """Error in protocol operation."""
 
 
 class BayeuxProtocol:
@@ -21,9 +48,13 @@ class BayeuxProtocol:
     ----------
         SUPPORTED_CONNECTION_TYPES (List[str]): Supported transport types
         VERSION (str): Protocol version implemented
-        advice (Dict[str, Any]): Server advice for connection management
-        is_handshaken (bool): Whether handshake is complete
-        supported_connection_types (List[str]): Server-supported transports
+        MINIMUM_VERSION (str): Minimum protocol version required
+        ERROR_CODES (Dict[str, int]): Protocol error codes and their numeric values
+        DEFAULT_ADVICE (Dict[str, Any]): Default server advice values for connection management
+        META_PATTERN (str): Regex pattern for meta channels
+        SERVICE_PATTERN (str): Regex pattern for service channels
+        VALID_CHANNEL_PATTERN (str): Regex pattern for valid channel names
+        VALID_SUBSCRIPTION_PATTERN (str): Regex pattern for valid subscription patterns
 
     Example:
     -------
@@ -37,67 +68,67 @@ class BayeuxProtocol:
 
     SUPPORTED_CONNECTION_TYPES: ClassVar[list[str]] = ["websocket", "long-polling"]
     VERSION = "1.0"
+    MINIMUM_VERSION = "1.0"
+
+    ERROR_CODES: ClassVar[dict[str, int]] = {
+        "CHANNEL_EMPTY": 400,
+        "CHANNEL_INVALID": 405,
+        "CHANNEL_FORBIDDEN": 403,
+        "CLIENT_UNKNOWN": 401,
+        "VERSION_MISMATCH": 300,
+        "CHANNEL_DENIED": 402,
+    }
+
+    DEFAULT_ADVICE: ClassVar[dict[str, Any]] = {
+        "reconnect": "retry",
+        "interval": 1000,
+        "timeout": 60000,
+    }
+
+    META_PATTERN: ClassVar[str] = r"^/meta/([^/]+)$"
+    SERVICE_PATTERN: ClassVar[str] = r"^/service/([^/]+)$"
+    VALID_CHANNEL_PATTERN: ClassVar[str] = r"^(/[^/]+)+$"
+    VALID_SUBSCRIPTION_PATTERN: ClassVar[str] = r"^(/[^/]+)*(/\*{1,2})?$"
 
     def __init__(self) -> None:
         """Initialize protocol state."""
         self._client_id: str | None = None
         self._supported_connection_types: list[str] = []
-        self.advice: dict[str, Any] = {}
-        self._handshaken = False
+        self._advice: dict[str, Any] = {}  # Initialize with empty advice
+        self._is_handshaken = False
         self._lock = Lock()
         self._current_operation: str | None = None
 
     @property
-    def is_handshaken(self) -> bool:
-        """Check if handshake is complete.
-
-        Returns
-        -------
-            bool: True if handshake is complete, False otherwise
-
-        """
-        return self._handshaken
+    def advice(self) -> dict[str, Any]:
+        """Get current server advice."""
+        return self._advice
 
     @property
     def supported_connection_types(self) -> list[str]:
-        """Get server-supported connection types.
-
-        Returns
-        -------
-            List[str]: List of transport types supported by server
-
-        """
+        """Get supported connection types."""
         return self._supported_connection_types
 
-    def _validate_response(self, response: Message) -> None:
-        """Validate response message and check for errors.
+    @supported_connection_types.setter
+    def supported_connection_types(self, value: list[str] | None) -> None:
+        """Set supported connection types."""
+        self._supported_connection_types = value or []
 
-        Args:
-        ----
-            response: The message to validate
-
-        Raises:
-        ------
-            ProtocolError: If response indicates an error
-
-        """
-        if not response.successful:
-            error_msg = response.error or "Unknown error"
-            raise ProtocolError(f"Server returned error: {error_msg}")
+    @property
+    def is_handshaken(self) -> bool:
+        """Check if handshake is complete."""
+        return self._is_handshaken
 
     async def handle_advice(self, advice: dict[str, Any] | None) -> None:
-        """Handle server advice for reconnection strategies.
-
-        Updates internal advice state with server recommendations for
-        reconnection behavior.
+        """Handle server advice.
 
         Args:
         ----
-            advice: Server advice dictionary containing reconnection instructions
+            advice: Server advice dictionary
 
         """
         if advice:
-            self.advice.update(advice)
+            self._advice = advice.copy()  # Store a copy of the advice
 
     async def process_handshake_response(self, response: Message) -> None:
         """Process handshake response from server.
@@ -112,27 +143,38 @@ class BayeuxProtocol:
 
         """
         if not response.successful:
-            raise HandshakeError(f"Handshake failed: {response.error}")
+            error_msg = response.error or "Unknown error"
+            error_code = (
+                ErrorCode.VERSION_MISMATCH
+                if "version" in error_msg.lower()
+                else ErrorCode.CLIENT_UNKNOWN
+            )
+            raise HandshakeError(
+                f"Handshake failed: {error_msg}",
+                error_code,
+                [],
+            )
+
+        # Handle advice if present
+        if response.advice:
+            await self.handle_advice(response.advice)
 
         self._client_id = response.client_id
-        # Convert connection types to lowercase for case-insensitive comparison
-        if response.supported_connection_types:
-            self._supported_connection_types = [
-                t.lower() for t in response.supported_connection_types
-            ]
-        else:
-            self._supported_connection_types = [
-                "websocket",
-                "long-polling",
-            ]  # Default fallback
+        self._supported_connection_types = [
+            t.lower()
+            for t in (
+                response.supported_connection_types or ["websocket", "long-polling"]
+            )
+        ]
 
         if not self._client_id:
-            raise HandshakeError("No client_id in handshake response")
+            raise HandshakeError(
+                "No client_id in handshake response",
+                ErrorCode.CLIENT_UNKNOWN,
+                [],
+            )
 
-        async with self._lock:
-            self._handshaken = True
-
-        await self.handle_advice(response.advice)
+        self._is_handshaken = True
 
     def create_handshake_message(
         self,
@@ -162,24 +204,30 @@ class BayeuxProtocol:
         if supported_connection_types is None:
             supported_connection_types = self.SUPPORTED_CONNECTION_TYPES
 
-        return Message(
-            channel="/meta/handshake",
-            version=self.VERSION,
-            supportedConnectionTypes=supported_connection_types,
-            minimumVersion="1.0",
-            ext=ext,
-        )
+        return Message.handshake(ext)
 
     def create_connect_message(self, connection_type: str = "websocket") -> Message:
-        """Create connect message for maintaining connection.
+        """Create connect message for maintaining connection."""
+        if not self._client_id:
+            raise ProtocolError(
+                "Cannot connect without client_id",
+                ErrorCode.CLIENT_UNKNOWN,
+                [],
+            )
 
-        Args:
-        ----
-            connection_type: Transport type being used
+        return Message(
+            channel="/meta/connect",
+            client_id=self._client_id,
+            connection_type=connection_type,
+            advice=self._advice if self._advice else None,  # Only include if not empty
+        )
+
+    def create_disconnect_message(self) -> Message:
+        """Create disconnect message according to Bayeux protocol.
 
         Returns:
         -------
-            Message: Connect message ready to send
+            Message: Disconnect message ready to send
 
         Raises:
         ------
@@ -187,31 +235,13 @@ class BayeuxProtocol:
 
         """
         if not self._client_id:
-            raise ProtocolError("Cannot connect without client_id. Handshake first.")
+            raise ProtocolError(
+                "Cannot disconnect without client_id",
+                self.ERROR_CODES["CLIENT_UNKNOWN"],
+                [],
+            )
 
-        return Message(
-            channel="/meta/connect",
-            client_id=self._client_id,
-            connection_type=connection_type,
-            advice=self.advice if self.advice else None,
-        )
-
-    def create_disconnect_message(self) -> Message:
-        """Create disconnect message according to Bayeux protocol.
-
-        Returns
-        -------
-            Message: Disconnect message ready to send
-
-        Raises
-        ------
-            ProtocolError: If client is not handshaken
-
-        """
-        if not self._client_id:
-            raise ProtocolError("Cannot disconnect without client_id")
-
-        return Message(channel="/meta/disconnect", client_id=self._client_id)
+        return Message.disconnect(self._client_id)
 
     def create_subscribe_message(self, subscription: str) -> Message:
         """Create subscription message according to Bayeux protocol.
@@ -231,14 +261,14 @@ class BayeuxProtocol:
 
         """
         if not self._client_id:
-            raise ProtocolError("Cannot subscribe without client_id")
+            raise ProtocolError(
+                "Cannot subscribe without client_id",
+                self.ERROR_CODES["CLIENT_UNKNOWN"],
+                [],
+            )
 
         self._validate_channel(subscription)
-        return Message(
-            channel="/meta/subscribe",
-            client_id=self._client_id,
-            subscription=subscription,
-        )
+        return Message.subscribe(self._client_id, subscription)
 
     def create_unsubscribe_message(self, subscription: str) -> Message:
         """Create unsubscribe message for a channel.
@@ -257,23 +287,44 @@ class BayeuxProtocol:
 
         """
         if not self._client_id:
-            raise ProtocolError("Cannot unsubscribe without client_id")
+            raise ProtocolError(
+                "Cannot unsubscribe without client_id",
+                self.ERROR_CODES["CLIENT_UNKNOWN"],
+                [],
+            )
 
-        return MessageFactory.unsubscribe(self._client_id, subscription)
+        return Message.unsubscribe(self._client_id, subscription)
 
-    def create_publish_message(
-        self,
-        channel: str,
-        data: str | int | bool | dict[str, Any] | list[str] | None,
-    ) -> Message:
-        """Create a publish message."""
+    def create_publish_message(self, channel: str, data: dict[str, Any]) -> Message:
+        """Create a publish message for sending data to a channel.
+
+        Args:
+        ----
+            channel: The channel to publish to
+            data: The data to publish. Non-dict data will be wrapped in a dict with 'value' key
+
+        Returns:
+        -------
+            Message: Publish message ready to send
+
+        Raises:
+        ------
+            ProtocolError: If client is not handshaken
+
+        """
         if not self._client_id:
-            raise ProtocolError("Not connected - no client ID")
-        return MessageFactory.publish(
-            channel=channel,
-            data=data,
-            client_id=self._client_id,
-        )
+            raise ProtocolError(
+                "Not connected - no client ID",
+                self.ERROR_CODES["CLIENT_UNKNOWN"],
+                [],
+            )
+
+        if isinstance(data, str | int | bool | list):
+            data = {"value": data}
+        elif data is None:
+            data = {}
+
+        return Message.publish(channel, data, self._client_id)
 
     def parse_message(self, data: str | dict[str, Any] | Message) -> Message:
         """Parse incoming message data into Message object.
@@ -297,25 +348,101 @@ class BayeuxProtocol:
         if isinstance(data, str):
             try:
                 data = json.loads(data)
-            except json.JSONDecodeError as e:
-                raise ProtocolError(f"Invalid JSON message: {e}") from e
+            except json.JSONDecodeError as err:
+                raise ProtocolError(
+                    f"Invalid JSON message: {err}",
+                    ErrorCode.CHANNEL_INVALID,
+                    [],
+                ) from err
 
         if not isinstance(data, dict):
-            raise ProtocolError(f"Invalid message format: {type(data)}")
+            raise ProtocolError(
+                f"Invalid message format: {type(data)}",
+                ErrorCode.CHANNEL_INVALID,
+                [],
+            )
 
         return Message.from_dict(data)
 
     def reset(self) -> None:
-        """Reset protocol state.
-
-        Clears client ID, handshake state, and other protocol state
-        in preparation for rehandshake.
-        """
-        self._client_id = None
-        self._handshaken = False
+        """Reset protocol state."""
         self._supported_connection_types = []
-        self.advice = {}
+        self._is_handshaken = False
+        self._client_id = None
+        self._advice = {}
         self._current_operation = None
+
+    def _validate_channel_empty(self, channel: str) -> None:
+        """Check if channel name is empty.
+
+        Args:
+        ----
+            channel: Channel name to validate
+
+        Raises:
+        ------
+            BayeuxError: If channel name is empty
+
+        """
+        if not channel:
+            raise BayeuxError(
+                "Channel name cannot be empty",
+                self.ERROR_CODES["CHANNEL_EMPTY"],
+                [],
+            )
+        if not channel.startswith("/"):
+            raise BayeuxError(
+                "Channel name must start with /",
+                self.ERROR_CODES["CHANNEL_INVALID"],
+                [],
+            )
+        if "//" in channel:
+            raise BayeuxError(
+                "Channel segments cannot be empty",
+                self.ERROR_CODES["CHANNEL_INVALID"],
+                [],
+            )
+
+    def _validate_meta_channel(self, channel: str) -> bool:
+        """Validate meta channel format."""
+        if re.match(self.META_PATTERN, channel):
+            if self._current_operation in ["subscribe", "publish"]:
+                raise BayeuxError(
+                    "Cannot subscribe or publish to meta channels",
+                    self.ERROR_CODES["CHANNEL_FORBIDDEN"],
+                    [],
+                )
+            return True
+        return False
+
+    def _validate_service_channel(self, channel: str) -> bool:
+        """Validate service channel format."""
+        if re.match(self.SERVICE_PATTERN, channel):
+            if self._current_operation in ["subscribe", "publish"]:
+                raise BayeuxError(
+                    "Cannot subscribe or publish to service channels",
+                    self.ERROR_CODES["CHANNEL_FORBIDDEN"],
+                    [],
+                )
+            return True
+        return False
+
+    def _validate_wildcards(self, channel: str) -> None:
+        """Validate wildcard usage in channel name."""
+        segments = channel.split("/")
+        for segment in segments[1:]:  # Skip first empty segment
+            if "*" in segment and segment not in ["*", "**"]:
+                raise BayeuxError(
+                    "Wildcard * can only be used as full segment",
+                    self.ERROR_CODES["CHANNEL_INVALID"],
+                    [],
+                )
+            if "**" in segment and segment != "**":
+                raise BayeuxError(
+                    "Wildcard ** can only be used as full segment",
+                    self.ERROR_CODES["CHANNEL_INVALID"],
+                    [],
+                )
 
     def _validate_channel(self, channel: str) -> None:
         """Validate channel name according to Bayeux spec.
@@ -326,39 +453,64 @@ class BayeuxProtocol:
 
         Raises:
         ------
-            FayeError: If channel name is invalid
-
-        Note:
-        ----
-            - Channel must start with /
-            - Segments cannot be empty
-            - Cannot subscribe/publish to /meta/ or /service/
-            - Wildcards * and ** must be full segments
+            BayeuxError: If channel name is invalid
 
         """
-        if not channel:
-            raise FayeError("Channel name cannot be empty")
+        # Basic validation
+        self._validate_channel_empty(channel)
 
-        if not channel.startswith("/"):
-            raise FayeError("Channel name must start with /")
+        # Check if it's a valid channel pattern
+        if not re.match(self.VALID_CHANNEL_PATTERN, channel):
+            raise BayeuxError(
+                "Channel segments cannot be empty",
+                self.ERROR_CODES["CHANNEL_INVALID"],
+                [],
+            )
 
-        segments = channel.split("/")
-        if "" in segments[1:]:  # Allow empty first segment for leading /
-            raise FayeError("Channel segments cannot be empty")
+        # Validate meta and service channels
+        if self._validate_meta_channel(channel) or self._validate_service_channel(
+            channel,
+        ):
+            return
 
-        # Different error messages for subscribe and publish
-        if channel.startswith("/meta/"):
-            if self._current_operation == "subscribe":
-                raise FayeError("Cannot subscribe to service channels")
-            else:
-                raise FayeError("Cannot publish to service channels")
+        # Validate subscription pattern for subscribe operations
+        if self._current_operation == "subscribe" and not re.match(
+            self.VALID_SUBSCRIPTION_PATTERN,
+            channel,
+        ):
+            raise BayeuxError(
+                "Invalid subscription pattern",
+                self.ERROR_CODES["CHANNEL_INVALID"],
+                [],
+            )
 
-        if channel.startswith("/service/"):
-            if self._current_operation == "subscribe":
-                raise FayeError("Cannot subscribe to service channels")
-            else:
-                raise FayeError("Cannot publish to service channels")
+        # Validate wildcards
+        self._validate_wildcards(channel)
 
-        # Allow ** as a full segment for globbing
-        if any(("*" in seg and seg not in ["*", "**"]) for seg in segments):
-            raise FayeError("Wildcard * can only be used as full segment")
+    def _validate_message(self, message: Message | dict[str, Any]) -> Message:
+        """Validate and convert message to Message object.
+
+        Args:
+        ----
+            message: Message to validate
+
+        Returns:
+        -------
+            Message: Validated message object
+
+        Raises:
+        ------
+            ProtocolError: If message is invalid
+
+        """
+        # Convert dict to Message if needed
+        if not isinstance(message, Message):
+            try:
+                message = Message.from_dict(message)
+            except Exception as err:
+                raise ProtocolError(
+                    f"Invalid message format: {err}",
+                    ErrorCode.CHANNEL_INVALID,
+                    [],
+                ) from err
+        return message

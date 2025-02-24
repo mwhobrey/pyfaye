@@ -1,0 +1,53 @@
+# Exclude patterns
+exclude = [
+    ".git",
+    ".pytest_cache",
+    "__pycache__",
+    "build",
+    "dist",
+    "tests/*",
+]
+
+# Line length
+line-length = 100
+
+# Target Python version
+target-version = "py310"
+
+[lint]
+# Enable all rules by default
+select = ["ALL"]
+
+# Ignore specific rules
+ignore = [
+    "D203",  # one-blank-line-before-class
+    "D213",  # multi-line-summary-second-line
+    "ANN101",  # missing-type-self
+    "ANN102",  # missing-type-cls
+    "FIX002",  # line-contains-todo
+    "BLE001",  # Do not catch blind exception
+    "G004",   # Logging statement uses f-string
+    "TRY400", # Use logging.exception instead of logging.error
+    "TRY003", # Avoid specifying long messages outside the exception class
+    "EM101",  # Exception must not use a string literal
+    "EM102",  # Exception must not use an f-string literal
+    "PLR0913", # Too many arguments in function definition
+    "PLR0911", # Too many return statements
+    "PERF203", # try-except within a loop incurs performance overhead
+    "TRY301", # Abstract raise to an inner function
+    "G201",   # Logging .exception(...) should be used instead of .error(..., exc_info=True)
+    "SLF001", # Private member accessed
+]
+
+# Per-file ignores
+[lint.per-file-ignores]
+"__init__.py" = ["F401", "PLC0414"]  # Ignore unused imports and import alias in __init__.py files
+
+[lint.mccabe]
+max-complexity = 10
+
+[lint.pydocstyle]
+convention = "google"
+
+[lint.pycodestyle]
+max-doc-length = 100 

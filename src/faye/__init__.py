@@ -9,14 +9,13 @@ Basic usage:
 
 from .client import FayeClient
 from .exceptions import (
-    AuthenticationError,
-    ConnectionError,
     FayeError,
     HandshakeError,
+    ProtocolError,
     TransportError,
+    parse_error,
 )
-from .extensions.authentication import AuthenticationExtension
-from .extensions.base import Extension
+from .extensions import Extension
 from .protocol import Message
 
 __version__ = "0.1.0"
@@ -27,11 +26,10 @@ __all__ = [
     "Message",
     # Extensions
     "Extension",
-    "AuthenticationExtension",
     # Exceptions
     "FayeError",
-    "AuthenticationError",
-    "TransportError",
     "HandshakeError",
-    "ConnectionError",
+    "ProtocolError",
+    "TransportError",
+    "parse_error",
 ]

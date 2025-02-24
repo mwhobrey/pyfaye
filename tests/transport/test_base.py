@@ -1,3 +1,5 @@
+"""Test base transport functionality."""
+
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -8,56 +10,60 @@ from faye.transport import Transport
 
 
 class DummyTransport(Transport):
-    """Dummy transport for testing base class functionality."""
+    """Dummy transport for testing."""
 
-    async def connect(self) -> None:
-        self._connected = True
+    async def _connect(self):
+        """Connect the transport."""
+        pass
 
-    async def disconnect(self) -> None:
-        self._connected = False
+    async def _disconnect(self):
+        """Disconnect the transport."""
+        pass
 
-    async def send(self, message: dict[str, Any]) -> Message:
-        if not self._connected:
-            raise TransportError("Not connected")
-        return Message(channel="/test", successful=True)
+    async def _ping(self):
+        """Send a ping message."""
+        pass
 
-    async def set_message_callback(self, callback):
-        """Set callback for incoming messages."""
-        self._message_callback = callback
+    async def _send(self, message: Message | list[Message]) -> Message | list[Message]:
+        """Send a message."""
+        if isinstance(message, list):
+            return [msg if isinstance(msg, Message) else Message.from_dict(msg) for msg in message]
+        return message if isinstance(message, Message) else Message.from_dict(message)
 
 
 @pytest.fixture
 def transport():
+    """Create test transport."""
     return DummyTransport("http://example.com")
 
 
 @pytest.mark.asyncio
-async def test_message_callback(transport):
-    """Test message callback handling."""
+async def test_message_callback():
+    """Test message callback."""
+    transport = DummyTransport("http://example.com")
     callback = AsyncMock()
-    message = Message(channel="/test", data="test")
-
     await transport.set_message_callback(callback)
-    await transport.handle_message(message)
 
+    message = Message("/test/channel")
+    await transport.handle_message(message)
     callback.assert_called_once_with(message)
 
 
 @pytest.mark.asyncio
-async def test_message_callback_error(transport):
-    """Test error handling in message callback."""
+async def test_message_callback_error():
+    """Test message callback error handling."""
+    transport = DummyTransport("http://example.com")
+    callback = AsyncMock(side_effect=Exception("Test error"))
+    await transport.set_message_callback(callback)
 
-    async def error_callback(message):
-        raise ValueError("Test error")
-
-    await transport.set_message_callback(error_callback)
-
+    message = Message("/test/channel")
     with pytest.raises(TransportError, match="Message callback error: Test error"):
-        await transport.handle_message(Message(channel="/test"))
+        await transport.handle_message(message)
 
 
-def test_connected_property(transport):
-    """Test connected property reflects internal state."""
-    assert not transport.connected
-    transport._connected = True
-    assert transport.connected
+def test_connected_property():
+    """Test connected property."""
+    transport = DummyTransport("http://example.com")
+    assert not transport.connected  # Should start disconnected
+    transport._state = transport.state.CONNECTED
+    assert transport.connected  # Should be connected after setting state
